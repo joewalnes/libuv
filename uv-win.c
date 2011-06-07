@@ -200,6 +200,21 @@ static struct sockaddr_in uv_addr_ip4_any_;
 static char uv_zero_[] = "";
 
 
+/* ares integration */
+/* ares socket callback */
+void SockStateCb(void *data, ares_socket_t sock, int read, int write);
+void uv_ares_process(uv_ares_t* handle, uv_req_t* req);
+
+/* list used for ares handles */
+static uv_ares_t* uv_ares_handles_ = NULL;
+
+/* memory used per ares_channel */
+struct uv_ares_channel_s {
+  ares_channel channel;
+};
+typedef struct uv_ares_channel_s uv_ares_channel_t;
+
+
 /* Atomic set operation on char */
 #ifdef _MSC_VER /* MSVC */
 
@@ -1576,6 +1591,10 @@ static void uv_process_reqs() {
         uv_async_return_req((uv_async_t*)handle, req);
         break;
 
+      case UV_ARES:
+        uv_ares_process((uv_ares_t*)handle, req);
+        break;
+
       default:
         assert(0);
     }
@@ -1764,3 +1783,205 @@ done:
 
   return retVal;
 }
+
+
+/* find matching ares handle in list */
+void uv_add_ares_handle(uv_ares_t* handle) {
+  handle->ares_next = uv_ares_handles_;
+  handle->ares_prev = NULL;
+
+  if (uv_ares_handles_) {
+    uv_ares_handles_->ares_prev = handle;
+  }
+  uv_ares_handles_ = handle;
+}
+
+/* find matching ares handle in list */
+/* TODO: faster lookup */
+uv_ares_t* uv_find_ares_handle(ares_socket_t sock) {
+  uv_ares_t* handle = uv_ares_handles_;
+  while (handle != NULL) {
+    if (handle->sock == sock) {
+      break;
+    }
+    handle = handle->ares_next;
+  }
+
+  return handle;
+}
+
+/* remove ares handle in list */
+void uv_remove_ares_handle(uv_ares_t* handle) {
+  if (handle == uv_ares_handles_) {
+    uv_ares_handles_ = handle->ares_next;
+  }
+
+  if (handle->ares_next) {
+    handle->ares_next->ares_prev = handle->ares_prev;
+  }
+
+  if (handle->ares_prev) {
+    handle->ares_prev->ares_next = handle->ares_next;
+  }
+}
+
+/* thread pool callback when socket is signalled */
+VOID CALLBACK uv_ares_socksignalTP(PVOID lpParameter,
+                                  BOOLEAN timerfired) {
+  assert(!timerfired);
+
+  assert(lpParameter != NULL);
+
+  if (lpParameter != NULL) {
+    uv_req_t* uv_ares_req = (uv_req_t*)lpParameter;
+
+    assert(uv_ares_req->handle != NULL);
+
+    if (!PostQueuedCompletionStatus(uv_iocp_,
+                                    0,
+                                    0,
+                                    &uv_ares_req->overlapped)) {
+      uv_fatal_error(GetLastError(), "PostQueuedCompletionStatus");
+    }
+  }
+}
+
+/* callback from ares when socket operation is started */
+void uv_ares_sockstateCb(void *data, ares_socket_t sock, int read, int write) {
+  /* look to see if we have a handle for this socket in our list */
+  uv_ares_t* uv_handle_ares = uv_find_ares_handle(sock);
+
+  if (read == 0 && write == 0) {
+    /* if read and write are 0, cleanup existing data */
+    if (uv_handle_ares != NULL) {
+      /* remove Wiat */
+      if (uv_handle_ares->hWait) {
+        UnregisterWait(uv_handle_ares->hWait);
+        uv_handle_ares->hWait = NULL;
+      }
+
+      /* detach socket from the event */
+      WSAEventSelect(sock, NULL, 0);
+      if (uv_handle_ares->hEvent != WSA_INVALID_EVENT) {
+        WSACloseEvent(uv_handle_ares->hEvent);
+        uv_handle_ares->hEvent = WSA_INVALID_EVENT;
+      }
+      /* remove handle from list and free it */
+      uv_remove_ares_handle(uv_handle_ares);
+      free(uv_handle_ares);
+
+      uv_refs_--;
+    }
+    else {
+      assert(0);
+    }
+  }
+  else {
+    uv_req_t* uv_req_ares;
+    if (uv_handle_ares == NULL) {
+      /* setup new handle */
+      uv_handle_ares = (uv_ares_t*)malloc(sizeof(uv_ares_t));
+      if (uv_handle_ares == NULL) {
+        uv_fatal_error(ERROR_OUTOFMEMORY, "malloc");
+      }
+      uv_handle_ares->type = UV_ARES;
+      uv_handle_ares->close_cb = NULL;
+      uv_handle_ares->data = data;
+      uv_handle_ares->sock = sock;
+      uv_handle_ares->read = read;
+      uv_handle_ares->write = write;
+      uv_handle_ares->hWait = NULL;
+
+      uv_req_ares = &uv_handle_ares->ares_req;
+      uv_req_init(uv_req_ares, (uv_handle_t*)uv_handle_ares, NULL);
+      uv_req_ares->type = UV_WAKEUP;
+
+      /* create an event to wait on socket signal */
+      uv_handle_ares->hEvent = WSACreateEvent();     // TODO WSACloseEvent
+      if (uv_handle_ares->hEvent == WSA_INVALID_EVENT) {
+        uv_fatal_error(WSAGetLastError(), "WSACreateEvent");
+      }
+
+      /* tie event to socket */
+      if (SOCKET_ERROR == WSAEventSelect(sock, uv_handle_ares->hEvent, FD_READ | FD_WRITE | FD_CONNECT)) {
+        uv_fatal_error(WSAGetLastError(), "WSAEventSelect");
+      }
+
+      /* add handle to list */
+      uv_add_ares_handle(uv_handle_ares);
+      uv_refs_++;
+
+      /* specify thread pool function to call when event is signaled */
+      if (RegisterWaitForSingleObject(&uv_handle_ares->hWait,
+                                  uv_handle_ares->hEvent,
+                                  uv_ares_socksignalTP,
+                                  (void*)&uv_handle_ares->ares_req,
+                                  INFINITE, 
+                                  WT_EXECUTEINWAITTHREAD) == 0) {
+        uv_fatal_error(GetLastError(), "RegisterWaitForSingleObject");
+      }
+    }
+    else {
+      /* found existing handle. update read & write flags */
+      uv_handle_ares->read = read;
+      uv_handle_ares->write = write;
+      assert(uv_handle_ares->type == UV_ARES);
+      assert(uv_handle_ares->data != NULL);
+      assert(uv_handle_ares->hWait == NULL);
+      assert(uv_handle_ares->hEvent != WSA_INVALID_EVENT);
+    }
+    // TODO: do we need to set flags?
+  }
+}
+
+/* called via uv_poll when ares completion port signaled */
+void uv_ares_process(uv_ares_t* handle, uv_req_t* req) {
+  ares_process_fd( ((uv_ares_channel_t*)handle->data)->channel, 
+                    handle->read ? handle->sock : INVALID_SOCKET,
+                    handle->write ?  handle->sock : INVALID_SOCKET);
+  
+  // we do not release resources here. 
+  // assume that we get called with read == 0 and write == 0 to to close this activity
+}
+
+/* set ares SOCK_STATE callback to our handler */
+int uv_ares_init_options(void **uv_data_ptr,
+                  ares_channel *channelptr,
+                  struct ares_options *options,
+                  int optmask) {
+  int rc;
+  /* allocate ares_channel_data */
+  uv_ares_channel_t *data = (uv_ares_channel_t*)malloc(sizeof(uv_ares_channel_t));
+  if (data == NULL) {
+    return ARES_ENOMEM;
+  }
+
+  /* set our callback as an option */
+  options->sock_state_cb = uv_ares_sockstateCb;
+  options->sock_state_cb_data = data;
+  optmask |= ARES_OPT_SOCK_STATE_CB;
+
+  // We do the call to ares_init_option for caller.
+  rc = ares_init_options(channelptr, options, optmask);
+
+  /* if success, save channel */
+  if (rc == ARES_SUCCESS) {
+    *uv_data_ptr = data;
+    data->channel = *channelptr;
+  }
+  else {
+    *uv_data_ptr = NULL;
+    free(data);
+  }
+
+  return rc;
+}
+
+/* release memory */
+void uv_ares_destroy(void *uv_data, ares_channel channel) {
+  ares_destroy(channel);
+  if (uv_data != NULL) {
+    free(uv_data);
+  }
+}
+

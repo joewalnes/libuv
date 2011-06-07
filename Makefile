@@ -31,13 +31,13 @@ BENCHMARKS=test/echo-server.c test/benchmark-*.c
 
 all: uv.a test/run-tests test/run-benchmarks
 
-test/run-tests$(E): test/*.h test/run-tests.c $(RUNNER_SRC) test/runner-unix.c $(TESTS) uv.a
+test/run-tests$(E): test/*.h test/run-tests.c $(RUNNER_SRC) test/runner-unix.c $(TESTS) uv.a c-ares/libcares.a
 	$(CC) $(RUNNER_CFLAGS) $(RUNNER_LINKFLAGS) -o test/run-tests test/run-tests.c \
-		test/runner.c $(RUNNER_SRC) $(TESTS) uv.a $(RUNNER_LIBS)
+		test/runner.c $(RUNNER_SRC) $(TESTS) uv.a c-ares/libcares.a $(RUNNER_LIBS)
 
-test/run-benchmarks$(E): test/*.h test/run-benchmarks.c test/runner.c $(RUNNER_SRC) $(BENCHMARKS) uv.a
+test/run-benchmarks$(E): test/*.h test/run-benchmarks.c test/runner.c $(RUNNER_SRC) $(BENCHMARKS) uv.a c-ares/libcares.a
 	$(CC) $(RUNNER_CFLAGS) $(RUNNER_LINKFLAGS) -o test/run-benchmarks test/run-benchmarks.c \
-		 test/runner.c $(RUNNER_SRC) $(BENCHMARKS) uv.a $(RUNNER_LIBS)
+		 test/runner.c $(RUNNER_SRC) $(BENCHMARKS) uv.a c-ares/libcares.a $(RUNNER_LIBS)
 
 test/echo.o: test/echo.c test/echo.h
 	$(CC) $(CFLAGS) -c test/echo.c -o test/echo.o
