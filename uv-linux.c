@@ -24,6 +24,10 @@
 #include <stddef.h>
 #include <time.h>
 
+#ifndef NANOSEC
+# define NANOSEC 1000000000
+#endif
+
 /*
  * There's probably some way to get time from Linux than gettimeofday(). What
  * it is, I don't know.
